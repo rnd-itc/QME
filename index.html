@@ -28,6 +28,30 @@
 <script src="https://unpkg.com/prop-types@15.8.1/prop-types.min.js"></script>
 <script src="https://unpkg.com/recharts@2.12.7/umd/Recharts.min.js"></script>
 
+<!-- Firebase Realtime Database -->
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
+<script>
+const firebaseConfig = {
+  apiKey: "AIzaSyAtWyHl5__xGnlcX0FtntdHg2Jx3Jv2IAQ",
+  authDomain: "itc-portal-bcd1f.firebaseapp.com",
+  databaseURL: "https://itc-portal-bcd1f-default-rtdb.firebaseio.com",
+  projectId: "itc-portal-bcd1f",
+  storageBucket: "itc-portal-bcd1f.firebasestorage.app",
+  messagingSenderId: "512874515039",
+  appId: "1:512874515039:web:38a667bb68d4adb40869ea"
+};
+let _fbDb = null;
+try {
+  firebase.initializeApp(firebaseConfig);
+  _fbDb = firebase.database();
+  console.log('[Firebase] initialized');
+} catch (e) {
+  console.warn('[Firebase] init failed — falling back to localStorage only', e);
+}
+window._fbDb = _fbDb;
+</script>
+
 <style>
   :root {
     /* === Dominant dark colors === */
@@ -657,7 +681,7 @@
         border: 4px solid #1a233220; border-top-color: #c8a464;
         border-radius: 50%; animation: bootspin 0.9s linear infinite;"></div>
       <div id="boot-title" style="font-size: 1.4rem; font-weight: 700; margin-bottom: 0.5rem;">טוען את הפורטל...</div>
-      <div id="boot-detail" style="color: #1a233299; font-size: 0.95rem; line-height: 1.6;">רגע, מאתחל את הספריות</div>
+      <div id="boot-detail" style="color: #1a233299; font-size: 0.95rem; line-height: 1.6;">רגע, מתחבר לענן ☁️</div>
     </div>
   </div>
 </div>
@@ -883,16 +907,63 @@ const circleLabel = (id) => findCircle(id)?.label || '';
 
 const uuid = (prefix='id') => `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2,9)}`;
 
+const _db = window._fbDb;
+const FB_ROOT = 'itc_portal';
+
 const storage = {
+  _cache: {},
+
+  async init() {
+    if (!_db) return;
+    try {
+      const snap = await _db.ref(FB_ROOT).once('value');
+      const data = snap.val() || {};
+      const keys = Object.values(STORAGE_KEYS);
+      for (const key of keys) {
+        if (data[key] !== undefined) {
+          this._cache[key] = data[key];
+          try { localStorage.setItem(key, JSON.stringify(data[key])); } catch {}
+        }
+      }
+      console.log('[Firebase] data loaded from cloud');
+    } catch (e) {
+      console.warn('[Firebase] init read failed — using localStorage', e);
+    }
+  },
+
+  listen(onChange) {
+    if (!_db) return;
+    const keys = Object.values(STORAGE_KEYS);
+    for (const key of keys) {
+      _db.ref(FB_ROOT + '/' + key).on('value', (snap) => {
+        const val = snap.val();
+        if (val === null) return;
+        const prev = JSON.stringify(this._cache[key]);
+        const next = JSON.stringify(val);
+        if (prev !== next) {
+          this._cache[key] = val;
+          try { localStorage.setItem(key, JSON.stringify(val)); } catch {}
+          if (onChange) onChange(key, val);
+        }
+      });
+    }
+  },
+
   get(key, fallback) {
+    if (this._cache[key] !== undefined) return this._cache[key];
     try {
       const raw = localStorage.getItem(key);
       return raw ? JSON.parse(raw) : fallback;
     } catch(e) { return fallback; }
   },
+
   set(key, value) {
-    try { localStorage.setItem(key, JSON.stringify(value)); return true; }
-    catch(e) { console.warn('storage set failed', e); return false; }
+    try {
+      this._cache[key] = value;
+      localStorage.setItem(key, JSON.stringify(value));
+      if (_db) _db.ref(FB_ROOT + '/' + key).set(value).catch(e => console.warn('[Firebase] write failed', e));
+      return true;
+    } catch(e) { console.warn('storage set failed', e); return false; }
   },
 };
 
@@ -2192,6 +2263,7 @@ function TranslationEditor({ form, setForm, onToast }) {
     if (form.description) jobs.push({ key: 'description', label: 'תיאור השאלון', text: form.description });
     (form.sections || []).forEach(sec => {
       if (sec.name) jobs.push({ key: `section:${sec.id}`, label: `סעיף: ${sec.name.slice(0,30)}`, text: sec.name });
+      if (sec.desc) jobs.push({ key: `sectionDesc:${sec.id}`, label: `תיאור סעיף: ${(sec.name || sec.desc).slice(0,25)}`, text: sec.desc });
     });
     allFields.forEach(f => {
       if (f.label) jobs.push({ key: `field:${f.id}`, label: f.label.slice(0, 40), text: f.label });
@@ -2216,6 +2288,9 @@ function TranslationEditor({ form, setForm, onToast }) {
         else if (job.key === 'description') newTr.description = translated;
         else if (job.key.startsWith('section:')) {
           newTr.sections = { ...(newTr.sections || {}), [job.key.slice(8)]: translated };
+        }
+        else if (job.key.startsWith('sectionDesc:')) {
+          newTr.sectionDescs = { ...(newTr.sectionDescs || {}), [job.key.slice(12)]: translated };
         }
         else if (job.key.startsWith('field:')) newTr.fields[job.key.slice(6)] = translated;
         // Save incrementally so progress isn't lost on error
@@ -2307,6 +2382,16 @@ function TranslationEditor({ form, setForm, onToast }) {
                      const curSections = { ...((form.translations || {})[activeLang]?.sections || {}), [sec.id]: e.target.value };
                      updateTranslation({ sections: curSections });
                    }} />
+            {sec.desc && (<>
+              <div className="text-xs text-[var(--ink-mute)] mb-1 mt-3">תיאור סעיף מקור:</div>
+              <div className="text-sm mb-2 text-[var(--ink-mute)]">{sec.desc}</div>
+              <textarea className="textarea" rows="2" value={((tr.sectionDescs || {})[sec.id]) || ''} placeholder="הזיני תרגום לתיאור הסעיף…"
+                     dir={LANGUAGES.find(l => l.code === activeLang)?.dir || 'ltr'}
+                     onChange={e => {
+                       const curDescs = { ...((form.translations || {})[activeLang]?.sectionDescs || {}), [sec.id]: e.target.value };
+                       updateTranslation({ sectionDescs: curDescs });
+                     }} />
+            </>)}
           </div>
         ))}
 
@@ -2727,7 +2812,11 @@ function PublicFillForm({ form, onSubmit, onClose, embedded=false, publicMode=fa
                     return (tr?.sections || {})[currentSec.id] || currentSec.name;
                   })()
                 }</h2>
-                {currentSec.desc && <p className="text-sm text-[var(--ink-mute)] mt-1 leading-relaxed">{currentSec.desc}</p>}
+                {(() => {
+                    const tr = (form.translations || {})[activeLang];
+                    const descText = (tr?.sectionDescs || {})[currentSec.id] || currentSec.desc;
+                    return descText ? <p className="text-sm text-[var(--ink-mute)] mt-1 leading-relaxed">{descText}</p> : null;
+                  })()}
               </div>
             )}
 
@@ -4262,9 +4351,7 @@ function LoginScreen({ onLogin, error }) {
             </button>
           </form>
         </div>
-        <div className="text-center mt-4 text-xs text-[var(--ink-mute)]">
-          כניסה ראשונה? שם משתמש: <span className="font-mono font-bold">admin</span> · סיסמה: <span className="font-mono font-bold">Itc2024!</span>
-        </div>
+
       </div>
     </div>
   );
@@ -4571,6 +4658,23 @@ function App() {
   useEffect(() => { storage.set(STORAGE_KEYS.users, users); }, [users]);
   useEffect(() => { storage.set(STORAGE_KEYS.folders, folders); }, [folders]);
   useEffect(() => { storage.set(STORAGE_KEYS.notifications, notifications); }, [notifications]);
+
+  // Firebase realtime sync
+  useEffect(() => {
+    const setterMap = {
+      [STORAGE_KEYS.evals]:         setEvals,
+      [STORAGE_KEYS.responses]:     setResponses,
+      [STORAGE_KEYS.templates]:     setUserTemplates,
+      [STORAGE_KEYS.series]:        setSeries,
+      [STORAGE_KEYS.users]:         setUsers,
+      [STORAGE_KEYS.folders]:       setFolders,
+      [STORAGE_KEYS.notifications]: setNotifications,
+    };
+    storage.listen((key, value) => {
+      const setter = setterMap[key];
+      if (setter) setter(value);
+    });
+  }, []);
 
   // Initialize default admin user + restore session
   useEffect(() => {
@@ -5517,9 +5621,15 @@ function QuestionnaireCard({ form, series, responseCount, canView, isAdmin, onDa
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// MOUNT
+// MOUNT — load cloud data, then render
 // ═══════════════════════════════════════════════════════════════════
-ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+(async function boot() {
+  const status = document.getElementById('boot-detail');
+  if (status) status.textContent = 'מסנכרן עם הענן...';
+  try { await storage.init(); } catch (e) { console.warn('Firebase init skipped', e); }
+  if (status) status.textContent = 'מאתחל את הפורטל...';
+  ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+})();
 
 </script>
 </body>
